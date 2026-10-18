@@ -2,7 +2,7 @@
 must never be adopted by a session that cannot positively prove ownership.
 
 Fixture timestamps are recent (now-based): restore_undelivered_completions
-terminally drops pending completions older than _MAX_COMPLETION_REPLAY_AGE_S,
+does not automatically offer completions older than _MAX_COMPLETION_REPLAY_AGE_S,
 so epoch-era toy timestamps would exercise the staleness cap instead of the
 restored-flag contract under test here.
 

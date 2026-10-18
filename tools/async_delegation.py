@@ -48,11 +48,10 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Completed records retained (in memory and in the ledger) for status queries.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
-_MAX_DURABLE_PENDING = 1000
-# Cap retried deliveries so an unroutable row converges to terminal 'dropped'.
+# Bound automatic retries without discarding an undelivered result.
 _MAX_DELIVERY_ATTEMPTS = 8
-# Pending completions older than this are dropped on restart replay instead of
-# re-run as a full-context turn; 48h keeps weekend results deliverable.
+# Older pending completions remain durable but are not automatically replayed
+# as full-context turns; 48h keeps weekend results automatically deliverable.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 # A delivery claim older than this is abandoned and may be re-claimed.
 _CLAIM_LEASE_S = 300.0
@@ -194,29 +193,21 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound settled history; pending results are not disposable history."""
     require_ledger_owner()
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
-        terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+        terminal_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing') AND delivery_state IN ('delivered','dropped')""").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state IN ('delivered','dropped')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
-        pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
-        if pending_count > _MAX_DURABLE_PENDING:
-            conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""", (pending_count - _MAX_DURABLE_PENDING,))
 
 
 def _persist_completion(event: dict[str, Any], result: dict[str, Any]) -> None:
@@ -335,8 +326,8 @@ def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
     process, so drains without an ownership filter must leave them for a consumer that can
-    prove ownership. Rows older than ``_MAX_COMPLETION_REPLAY_AGE_S`` are terminally dropped
-    instead of replaying a turn nobody is waiting on.
+    prove ownership. Rows past the replay age or delivery budget stay pending without
+    automatic replay; elapsed time and failed attempts do not acknowledge a result.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the stamp is added after the durable
     payload is deserialized and is never persisted). Restored events originate from a *previous* process, so
@@ -355,28 +346,22 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, delivery_attempts
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        return _replay_pending(conn, rows, target_queue, now, startup=True)
+        return _replay_pending(rows, target_queue, now, startup=True)
 
 
-def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = False) -> int:
-    """Put each pending ``(delegation_id, event_json, completed_at, dispatched_at)`` row on ``target_queue``
-    stamped ``restored``, or terminally drop it past ``_MAX_COMPLETION_REPLAY_AGE_S``. Records the offer so
-    the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
+def _replay_pending(rows, target_queue, now: float, *, startup: bool = False) -> int:
+    """Offer eligible pending rows without changing their durable delivery state.
+    Automatic retry limits park the result; only a consumer's receipt or an explicit
+    permanent session boundary can settle it. Track each in-memory offer for the sweep."""
     home, restored = hermes_home_key(get_hermes_home()), 0
-    for delegation_id, payload, completed_at, dispatched_at in rows:
+    for delegation_id, payload, completed_at, dispatched_at, attempts in rows:
         age_basis = completed_at or dispatched_at
-        if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
-            conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
-                          delivery_claim=NULL, delivery_claimed_at=NULL,
-                          updated_at=?
-                   WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
-            logger.warning("Async delegation %s: pending completion is %.1fh old "
-                           "(cap %.1fh); terminally dropping the replay (result remains queryable).",
-                           delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+        if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS or (age_basis and now - age_basis > _MAX_COMPLETION_REPLAY_AGE_S):
+            logger.debug("Async delegation %s: automatic replay limit reached; retaining pending result.", delegation_id)
             continue
         with _orphan_lock:
             if (home, delegation_id) in _offered:
@@ -410,8 +395,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     check. A row is offered once per live in-memory copy: a consumer that discards the copy with the row
     still pending hands it back for the next sweep. The consumer's ``claim_completion_delivery`` stays
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
-    the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
-    callers bind the owning profile first."""
+    the delivery budget or the replay age remain pending without another automatic offer.
+    Reads the current profile's ledger: callers bind the owning profile first."""
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
         return 0  # never create a ledger just to sweep it
@@ -432,17 +417,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts in rows:
             if delegation_id in offered or alive(pid, started):
                 continue
-            if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
-                # Its last claimant died holding the final attempt; converge like release_completion_delivery.
-                conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
-                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                       WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
-                logger.warning("Async delegation %s exhausted its %d delivery attempts; "
-                               "marking terminally dropped (result remains queryable).",
-                               delegation_id, _MAX_DELIVERY_ATTEMPTS)
-                continue
-            orphans.append((delegation_id, payload, completed_at, dispatched_at))
-        return _replay_pending(conn, orphans, target_queue, now)
+            orphans.append((delegation_id, payload, completed_at, dispatched_at, attempts))
+        return _replay_pending(orphans, target_queue, now)
 
 
 def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
@@ -489,9 +465,9 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             return True  # legacy event created before durable dispatch
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_state='pending' AND delivery_attempts < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - _CLAIM_LEASE_S))
+            (claim_id, now, now, delegation_id, _MAX_DELIVERY_ATTEMPTS, now - _CLAIM_LEASE_S))
         return cur.rowcount == 1
 
 
@@ -514,28 +490,14 @@ def claim_event_delivery(evt: dict[str, Any], consumer: str) -> Optional[str]:
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Release a failed delivery claim so another consumer may retry. Attempts are
-    counted at claim time; once the budget is exhausted the row converges to
-    terminal ``dropped`` (only pending rows replay on restart)."""
+    """Release a failed claim, retaining the pending result and its attempt count.
+    Automatic offers and delivery claims enforce the budget without settling the result."""
     if remote := worker_ledger():
         return remote.release(delegation_id, claim_id)
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
-                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=? AND delivery_attempts>=?""",
-            (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
-        if capped.rowcount == 1:
-            logger.warning("Async delegation %s exhausted its %d delivery attempts; "
-                           "marking terminally dropped (result remains queryable).",
-                           delegation_id, _MAX_DELIVERY_ATTEMPTS)
-            return True
-        cur = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=?""", (now, delegation_id, claim_id))
-        return cur.rowcount == 1
+    return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
+                  delivery_claimed_at=NULL, updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending'
+             AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
 
 
 def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -579,29 +541,21 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
     """Offer an acknowledged completion again when its receiving turn could not confirm the owner.
 
     The row returns to pending and its event goes back on ``target_queue``, so the next delivery
-    re-runs the pre-flight. A row past the delivery budget converges to ``dropped`` instead, which
-    bounds the loop; a row without a stored event is left as it is."""
+    re-runs the pre-flight. Past the automatic replay limits it stays pending without an offer,
+    bounding the loop while preserving the result. A row without a stored event is left as it is."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        exhausted = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
-               WHERE delegation_id=? AND delivery_state='delivered' AND delivery_attempts>=?""",
-            (now, delegation_id, _MAX_DELIVERY_ATTEMPTS))
-        if exhausted.rowcount == 1:
-            logger.warning("Async delegation %s exhausted its %d delivery attempts; "
-                           "marking terminally dropped (result remains queryable).",
-                           delegation_id, _MAX_DELIVERY_ATTEMPTS)
-            return False
         reopened = conn.execute("""UPDATE async_delegations SET delivery_state='pending',
                       delivered_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='delivered' AND event_json IS NOT NULL""",
             (now, delegation_id))
         if reopened.rowcount != 1:
             return False
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, delivery_attempts
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
         with _orphan_lock:  # an admitted copy already had its consumer: requeue keeps live routing
             _startup_replayed.discard(delegation_id)
-        return _replay_pending(conn, rows, target_queue, now) == 1
+        return _replay_pending(rows, target_queue, now) == 1
 
 
 def complete_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
@@ -880,12 +834,15 @@ def _dispatch_admitted(
 
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    reserved = retirement.acquire()
     try:
+        if not reserved:
+            raise RuntimeError("backend maintenance closed before worker handoff")
         future = executor.submit(propagate_context_to_thread(_worker))
         future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
+    except Exception as exc:  # pool failure or maintenance refusal before a worker exists
+        if reserved:
+            retirement.release()
         with _records_lock:
             _records.pop(delegation_id, None)
         if remote := worker_ledger():

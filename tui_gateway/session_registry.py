@@ -295,10 +295,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
             ready.set()
 
-    build_thread = threading.Thread(target=_build, daemon=True)
-    # _wait_agent_for_prompt handle: dead thread + unset agent_ready = died hard; waiters must not sit out the cap.
+    build_thread = _start_session_work(_build, name=f"agent-build-{sid}")
+    # A maintenance refusal must wake an already waiting prompt without constructing an agent.
+    if build_thread is None:
+        session["agent_error"] = AGENT_BUILD_ABANDONED
+        ready.set()
     session["_agent_build_thread"] = build_thread
-    build_thread.start()
 
 
 def _sess_nowait(params, rid):
@@ -636,7 +638,8 @@ def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool =
                     db.close()
                 except Exception:
                     logger.debug("failed to close resume db for %s", sid, exc_info=True)
-    threading.Thread(target=_run, daemon=True).start()
+    if _start_session_work(_run, name=f"resume-history-{sid}") is None and close_db:
+        db.close()
 
 
 def _session_pending_kind(sid: str) -> str:

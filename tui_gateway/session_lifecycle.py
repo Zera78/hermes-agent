@@ -26,14 +26,16 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
-    if not retirement.acquire():
+    reservation = retirement.reserve()
+    if reservation is None:
         return None
 
     def run():
         try:
-            target()
+            with reservation.scope():
+                target()
         finally:
-            retirement.release()
+            reservation.finish()
 
     try:
         thread = spawn_context_thread(run, name=name)
@@ -41,8 +43,9 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
             session["_run_thread"] = thread
         thread.start()
         return thread
-    except BaseException:
-        retirement.release()
+    except Exception:
+        # An interrupted start can have an unknown outcome; retain ownership then.
+        reservation.finish()
         raise
 
 
@@ -427,11 +430,27 @@ def _lock_vault_managers(session: dict) -> None:
         logging.getLogger(__name__).debug("vault manager lock on session end failed", exc_info=True)
 
 
+_NOTIFICATION_STOP_TIMEOUT = 5.0
+
+
+def _stop_session_notifications(session, timeout=None):
+    if (stop := session.get("_notif_stop")) is not None:
+        stop.set()
+    thread = session.get("_notif_thread")
+    if thread is not None:
+        if thread is threading.current_thread():
+            raise RuntimeError("Notification poller cannot tear itself down")
+        thread.join(_NOTIFICATION_STOP_TIMEOUT if timeout is None else max(0.0, timeout))
+        if thread.is_alive():
+            raise TimeoutError("Notification poller did not stop")
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit; mirrors the CLI exit path so a force-quit mid-turn (double
     Ctrl-C, terminal close, SIGHUP) loses nothing."""
     if not session or session.get("_finalized"):
         return
+    _stop_session_notifications(session)
     session["_finalized"] = True
     _lock_vault_managers(session)
     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
@@ -1066,7 +1085,9 @@ def _schedule_ws_orphan_reap(
     with _sessions_lock:
         if _expected_timer is not None and _pending_ws_reaps.get(sid) is not _expected_timer:
             return
-        timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S if delay_s is None else max(0.0, delay_s), _reap)
+        from hermes_cli.backend_retirement import retirement
+        timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S if delay_s is None else max(0.0, delay_s),
+                                lambda: retirement.run_if_admitted(_reap))
         timer.daemon = True
         prior = _pending_ws_reaps.pop(sid, None)
         _pending_ws_reaps[sid] = timer

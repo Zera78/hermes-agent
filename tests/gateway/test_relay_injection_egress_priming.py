@@ -15,7 +15,7 @@ scope_id/user_id — the fix is priming the adapter's routing caches from the
 synthetic event before dispatching it.
 
 Also pins the replay staleness cap: restored completions older than the cap
-must be terminally dropped, not replayed as full-context turns (one July
+must stay pending without replaying full-context turns (one July
 session replayed in August burned a 102K-token context).
 """
 
@@ -160,7 +160,7 @@ class _Queue:
         self.items.append(item)
 
 
-def test_restore_drops_completions_older_than_replay_cap(_isolated_delegation_db):
+def test_restore_parks_completions_older_than_replay_cap(_isolated_delegation_db):
     ad = _isolated_delegation_db
     now = time.time()
     _insert_pending(ad, "deleg_fresh", now - 3600)
@@ -182,9 +182,9 @@ def test_restore_drops_completions_older_than_replay_cap(_isolated_delegation_db
         "(102K-token replay incident class)"
     )
     assert restored == 1
-    # The stale row must converge to a terminal state, not replay forever.
+    # The stale row stays pending without automatic replay or an acknowledgement.
     with ad._DB_LOCK, ad._transaction() as conn:
         state = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id='deleg_stale'"
         ).fetchone()[0]
-    assert state == "dropped"
+    assert state == "pending"

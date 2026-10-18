@@ -151,6 +151,17 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
 
 
+def _notification_stopping(session: dict) -> bool:
+    from hermes_cli.backend_retirement import retirement
+    stop = session.get("_notif_stop")
+    return retirement.is_closed() or bool(stop is not None and stop.is_set()) or bool(session.get("_finalized"))
+
+
+def _defer_notification_events(events, registry, deferred=None):
+    for event in events:
+        (deferred.append if deferred is not None else registry.completion_queue.put)(event)
+
+
 def _notif_release_turn(session: dict) -> None:
     with session["history_lock"]:
         session["running"] = False
@@ -161,7 +172,7 @@ def _notif_claim_turn(session: dict) -> bool:
     After the user's Stop no automatic turn starts: the cancel latch holds notifications
     (requeued by the callers) until the next user prompt clears it."""
     with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
+        if not admitted or _notification_stopping(session) or session.get("running") or session.get("_turn_cancel_requested"):
             return False
         session["running"] = True
         return True
@@ -188,6 +199,8 @@ def _notif_refusal_backoff(session: dict) -> None:
 def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
     """Only the execution gate can acknowledge a claimed notification turn."""
     try:
+        if _notification_stopping(session):
+            raise RuntimeError("Notification admission closed before submit")
         accepted = _run_prompt_submit(rid, sid, session, text, **kwargs)
         if accepted:
             session.pop("_notif_refusal_delay", None)
@@ -531,6 +544,17 @@ def _background_notifications_off(session: dict) -> bool:
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
     """Run the claimed (running=True) agent turn for one notification event."""
+    from hermes_cli.backend_retirement import retirement
+    from tools.process_registry import process_registry
+    with retirement.work() as admitted:
+        if not admitted or _notification_stopping(session):
+            _notif_release_turn(session)
+            _defer_notification_events([evt], process_registry)
+            return
+        return _notif_dispatch_admitted_event(sid, session, evt, text)
+
+
+def _notif_dispatch_admitted_event(sid, session, evt, text):
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
         claim = claim_event_delivery(evt, "tui-poller")
@@ -542,6 +566,12 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
+        return
+    if _notification_stopping(session):
+        from tools.process_registry import process_registry
+        release_event_delivery(evt, claim)
+        _notif_release_turn(session)
+        _defer_notification_events([evt], process_registry)
         return
     evt_type = evt.get("type")
     kwargs: dict = {}
@@ -564,6 +594,9 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
             return
     except Exception:
         release_event_delivery(evt, claim)
+        if _notification_stopping(session):
+            from tools.process_registry import process_registry
+            _defer_notification_events([evt], process_registry)
         return
     complete_event_delivery(evt, claim)
 
@@ -575,6 +608,9 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     idle. False = the drain must stop (session busy). ``owned`` skips the ownership gates for events a caller already
     drained through ``_session_owns_notification_event`` (the post-turn safety net), so lineage resolves once."""
     queue = registry.completion_queue
+    if _notification_stopping(session):
+        _defer_notification_events([evt], registry, deferred)
+        return True
     evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") == "async_delegation"
     if not owned and _notification_event_belongs_elsewhere(sid, session, evt):
         if deferred is not None:
@@ -635,6 +671,15 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
 
 
 def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
+    from hermes_cli.backend_retirement import retirement
+    with retirement.work() as admitted:
+        if not admitted or _notification_stopping(session):
+            _defer_notification_events([e for e, _ in notifications], registry, deferred)
+            return
+        return _notif_dispatch_admitted_completions(sid, session, notifications, registry, deferred)
+
+
+def _notif_dispatch_admitted_completions(sid, session, notifications, registry, deferred):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
@@ -649,8 +694,16 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     claimed: list = []
     try:
         for event, event_text in notifications:
+            if _notification_stopping(session):
+                break
             if (claim := claim_event_delivery(event, "tui-completion-batch")) is not None:
                 claimed.append((event, event_text, claim))
+        if _notification_stopping(session):
+            for event, _text, claim in claimed:
+                release_event_delivery(event, claim)
+            _notif_release_turn(session)
+            _defer_notification_events([e for e, _ in notifications], registry, deferred)
+            return
         batch = ProcessNotificationBatch(tuple((event, event_text) for event, event_text, _claim in claimed))
         text = batch.render(registry)
     except Exception as exc:
@@ -676,6 +729,8 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
+        if _notification_stopping(session):
+            _defer_notification_events([e for e, _ in notifications], registry, deferred)
         return
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
@@ -683,6 +738,15 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
 
 def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):
     """One ready snapshot: ownership and UI emission per event, one turn per completion run."""
+    from hermes_cli.backend_retirement import retirement
+    with retirement.work() as admitted:
+        if not admitted or _notification_stopping(session):
+            _defer_notification_events(events, registry, deferred)
+            return
+        return _notif_handle_admitted_ready(sid, session, events, emitted, registry, fmt, deferred, owned=owned)
+
+
+def _notif_handle_admitted_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):
     completions = []
     for index, event in enumerate(events):
         if event.get("type", "completion") != "completion":
@@ -696,6 +760,8 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
 
 
 def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
+    if stop_event.is_set() or _notification_stopping(session):
+        return
     with _session_profile_runtime_scope(session):
         _notification_poller_scoped_loop(stop_event, sid, session)
 
@@ -709,31 +775,40 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     subscriptions and delivers terminal task events the same way (status.update + agent turn) — the delivery
     path tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
+    from hermes_cli.backend_retirement import retirement
+    if stop_event.is_set() or _notification_stopping(session):
+        return
     from tools import async_delegation
     from tools.process_registry import process_registry
     from tools.process_registry_notifications import format_process_notification
-    process_registry.restore_completions()  # first consumer in a TUI process (#123265)
+    with retirement.work() as admitted:
+        if not admitted or stop_event.is_set() or _notification_stopping(session):
+            return
+        process_registry.restore_completions()  # first consumer in a TUI process (#123265)
     queue = process_registry.completion_queue
     emitted = session.setdefault("_notification_emitted", set())
     handle = lambda events, deferred: _notif_handle_ready(
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
     last_kanban_poll = last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
-        now = time.monotonic()
-        # Completions whose owner process died after this one started (#97202); throttled per profile home.
-        async_delegation.maybe_sweep_orphaned_completions(queue)
-        # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
-        # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
-        if now - last_loop_poll >= _LOOP_POLL_SECONDS:
-            last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
-                try:
-                    fire(sid, session)
-                except Exception as tick_exc:
-                    _notif_log_failure(f"{what} poll failed", tick_exc)
-        if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
-            last_kanban_poll = now
-            _notif_poll_kanban(sid, session)
+        with retirement.work() as admitted:
+            if not admitted or stop_event.is_set() or _notification_stopping(session):
+                break
+            now = time.monotonic()
+            # Completions whose owner process died after this one started (#97202); throttled per profile home.
+            async_delegation.maybe_sweep_orphaned_completions(queue)
+            # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
+            # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
+            if now - last_loop_poll >= _LOOP_POLL_SECONDS:
+                last_loop_poll = now
+                for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+                    try:
+                        fire(sid, session)
+                    except Exception as tick_exc:
+                        _notif_log_failure(f"{what} poll failed", tick_exc)
+            if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
+                last_kanban_poll = now
+                _notif_poll_kanban(sid, session)
         try:
             evt = queue.get(timeout=0.5)
         except Exception:
@@ -749,19 +824,9 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         except Exception as exc:
             # This thread is the session's only path to notifications, /loop, /heartbeat and its
             # bot mailbox; one bad event must not end all four.
+            if _notification_stopping(session):
+                session["_notification_shutdown_error"] = type(exc).__name__
             _notif_log_failure("notification dispatch failed", exc)
-    # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
-    # events are handed back to the shared queue afterwards.
-    deferred: list = []
-    ready = []
-    for _ in range(queue.qsize()):
-        try:
-            ready.append(queue.get_nowait())
-        except Exception:
-            break
-    handle(ready, deferred)
-    for evt in deferred:
-        queue.put(evt)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -815,11 +880,24 @@ _notification_pollers: list = []
 
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session (thread name is greppable)."""
+    from hermes_cli.backend_retirement import retirement
+    with retirement.work() as admitted:
+        if not admitted:
+            stop = threading.Event()
+            stop.set()
+            return stop
+        return _spawn_notification_poller(sid, session)
+
+
+def _spawn_notification_poller(sid, session):
     _wire_desktop_sinks()
     stop = threading.Event()
+    session["_notif_stop"] = stop
     t = threading.Thread(target=_notification_poller_loop, args=(stop, sid, session), daemon=True, name=f"tui-notif-poller-{sid}")
-    _notification_pollers[:] = [(s, th) for (s, th) in _notification_pollers if th.is_alive()] + [(stop, t)]
-    t.start()
+    with _sessions_lock:
+        _notification_pollers[:] = [(s, th) for (s, th) in _notification_pollers if th.is_alive()] + [(stop, t)]
+        session["_notif_thread"] = t
+        t.start()
     return stop
 
 

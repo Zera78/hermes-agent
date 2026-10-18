@@ -240,7 +240,9 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
-    threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
+    if _start_session_work(interrupt, name=f"busy-interrupt-{sid}") is None:
+        with session["history_lock"]:
+            session["_busy_interrupt_pending"] = False
 
 
 def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:

@@ -366,7 +366,8 @@ def _reaper_daemon_timer(delay: float, fn, fail_log: str, level: str = "debug") 
     """Run ``fn`` once on a daemon Timer after ``delay``; log (never raise) on failure."""
     def _run() -> None:
         try:
-            fn()
+            from hermes_cli.backend_retirement import retirement
+            retirement.run_if_admitted(fn)
         except Exception:
             getattr(logger, level)(fail_log, exc_info=True)
 
@@ -461,6 +462,11 @@ def _gateway_started_at() -> float:
 
 def _refresh_backend_heartbeat() -> None:
     """Refresh this backend's heartbeat row. No-op when DB unavailable."""
+    from hermes_cli.backend_retirement import retirement
+    return retirement.run_if_admitted(_refresh_admitted_backend_heartbeat)
+
+
+def _refresh_admitted_backend_heartbeat():
     db = _get_db()
     if db is None:
         return
@@ -499,6 +505,9 @@ def _start_backend_heartbeat_refresher() -> None:
 
     def _atexit_clear():
         stop_event.set()
+        from hermes_cli.backend_retirement import retirement
+        if retirement.is_closed():
+            return
         with contextlib.suppress(Exception):
             if (db := _get_db()) is not None:
                 db.clear_backend_heartbeat(_backend_id_for_this_process())

@@ -17,7 +17,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, spawn_context_thread
+from agent.memory_provider import MemoryProvider
+from agent.memory_lifecycle import ProviderJobs, owned_call
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ def _run_brv(args: list[str], timeout: int = _QUERY_TIMEOUT, cwd: str | None = N
     global _cached_brv_path
     brv_path = _resolve_brv_path()
     if not brv_path:
-        return {"success": False, "error": "brv CLI not found. Install: npm install -g byterover-cli"}
+        return {"success": False, "local_settled": True, "error": "brv CLI not found. Install: npm install -g byterover-cli"}
     effective_cwd = cwd or str(_get_brv_cwd())
     Path(effective_cwd).mkdir(parents=True, exist_ok=True)
     env = _brv_child_env(brv_path)
@@ -117,17 +118,20 @@ def _run_brv(args: list[str], timeout: int = _QUERY_TIMEOUT, cwd: str | None = N
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"brv timed out after {timeout}s"}
+        return {"success": False, "local_settled": False, "error": f"brv timed out after {timeout}s"}
     except FileNotFoundError:
         with _brv_path_lock:
             _cached_brv_path = None  # binary vanished; re-resolve next call
-        return {"success": False, "error": "brv CLI not found"}
+        return {"success": False, "local_settled": True, "error": "brv CLI not found"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "local_settled": False, "error": str(e)}
+    # subprocess.run proves the direct child was reaped. The retained source
+    # contains no reviewed brv descendant-settlement protocol, so a normal CLI
+    # result alone cannot promote this invocation to strict maintenance support.
     stdout, stderr = result.stdout.strip(), result.stderr.strip()
     if result.returncode == 0:
-        return {"success": True, "output": stdout}
-    return {"success": False, "error": stderr or stdout or f"brv exited {result.returncode}"}
+        return {"success": True, "local_settled": False, "output": stdout}
+    return {"success": False, "local_settled": False, "error": stderr or stdout or f"brv exited {result.returncode}"}
 
 
 def _schema(name: str, description: str, arg: str = "", arg_desc: str = "") -> dict:
@@ -150,6 +154,9 @@ class ByteRoverMemoryProvider(MemoryProvider):
     """ByteRover persistent memory via the brv CLI."""
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
+        self._jobs = ProviderJobs(self)
+        self._invocation_lock = threading.Lock()
+        self._unknown_invocations = 0
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._auto_extract = _coerce_bool(self._config.get("auto_extract"), True)
         self._cwd, self._session_id, self._turn_count = "", "", 0
@@ -171,6 +178,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
              "default": "true", "choices": ["true", "false"]},
         ]
 
+    @owned_call
     def initialize(self, session_id: str, **kwargs) -> None:
         # Bind to the profile the manager names, not the ambient one (multiplexing contract, MemoryProvider).
         home = kwargs.get("hermes_home")
@@ -184,11 +192,29 @@ class ByteRoverMemoryProvider(MemoryProvider):
         return ("# ByteRover Memory\nActive. Persistent knowledge tree with hierarchical context.\n"
                 "Use brv_query to search past knowledge, brv_curate to store important facts, brv_status to check state.")
 
+    @owned_call
+    def _invoke(self, args, *, timeout, cwd):
+        # Record before the boundary: an exception or no-result response cannot
+        # erase uncertainty, and a later successful invocation cannot erase it.
+        with self._invocation_lock: self._unknown_invocations += 1
+        result = _run_brv(args, timeout=timeout, cwd=cwd)
+        if isinstance(result, dict) and result.get("local_settled") is True:
+            with self._invocation_lock: self._unknown_invocations -= 1
+        return result
+
+    def maintenance_drain(self, deadline: float) -> bool:
+        self._jobs.drain(deadline)
+        with self._invocation_lock:
+            unknown = self._unknown_invocations
+        if unknown:
+            raise RuntimeError(f"Unsupported ByteRover CLI descendant settlement: {unknown} invocation(s)")
+        return True
+
     def _query(self, query: str) -> dict:
-        return _run_brv(["query", "--", query.strip()[:5000]], timeout=_QUERY_TIMEOUT, cwd=self._cwd)
+        return self._invoke(["query", "--", query.strip()[:5000]], timeout=_QUERY_TIMEOUT, cwd=self._cwd)
 
     def _curate(self, content: str) -> dict:
-        return _run_brv(["curate", "--", content], timeout=_CURATE_TIMEOUT, cwd=self._cwd)
+        return self._invoke(["curate", "--", content], timeout=_CURATE_TIMEOUT, cwd=self._cwd)
 
     def _curate_in_background(self, content: str, *, name: str, what: str, on_done: str = "") -> threading.Thread:
         """Spawn a daemon thread that curates ``content``; failures are logged at debug, never raised."""
@@ -200,8 +226,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("ByteRover %s failed: %s", what, e)
 
-        t = spawn_context_thread(_work, name=name)
-        t.start()
+        t = self._jobs.start(_work, name=name)
         return t
 
     def _auto_extract_enabled(self, what: str) -> bool:
@@ -276,7 +301,7 @@ def _format_query_output(output: str) -> dict:
 _TOOLS = {
     "brv_query": ("query", "Query failed", lambda p, q: p._query(q), _format_query_output),
     "brv_curate": ("content", "Curate failed", lambda p, c: p._curate(c), lambda _: {"result": "Memory curated successfully."}),
-    "brv_status": (None, "Status check failed", lambda p, _: _run_brv(["status"], timeout=15, cwd=p._cwd), lambda out: {"status": out}),
+    "brv_status": (None, "Status check failed", lambda p, _: p._invoke(["status"], timeout=15, cwd=p._cwd), lambda out: {"status": out}),
 }
 
 
