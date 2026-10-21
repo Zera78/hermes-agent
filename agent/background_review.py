@@ -72,21 +72,26 @@ def _optional_lock(agent: Any, attr: str) -> Iterator[None]:
         yield
 
 
-def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
-    """Install a unique run token on the parent before ``Thread.start()``."""
+def prepare_background_review_run(agent: Any, *, wait_for_slot: bool = False) -> Optional[_BackgroundReviewRun]:
+    """Install before start; maintenance dispatch retains accepted work behind a busy request."""
     run = _BackgroundReviewRun()
     try:
         lock = getattr(agent, "_background_review_lock", None)
         if lock is None:
             lock = agent._background_review_lock = threading.Lock()
-        with lock:
-            current = getattr(agent, "_background_review_run", None)
-            if current is not None and not current.request_done.is_set():
-                return None
-            agent._background_review_run = run
+        while True:
+            with lock:
+                current = getattr(agent, "_background_review_run", None)
+                if current is None or current.request_done.is_set():
+                    agent._background_review_run = run
+                    return run
+                if not wait_for_slot:
+                    return None
+            # The dispatcher owns this item throughout the wait. A stuck request makes
+            # the finite maintenance proof refuse; it cannot authorize dropping the item.
+            current.request_done.wait(timeout=1.0)
     except (AttributeError, TypeError):
         return None
-    return run
 
 
 def finish_background_review_run(agent: Any, run: Optional[_BackgroundReviewRun]) -> None:
@@ -112,17 +117,33 @@ def _interrupt_background_review(
     cancelling for a different reason (e.g. the owning session itself is ending, #102895) should
     pass their own so logs/diagnostics describe what actually happened.
     """
+    from agent.memory_provider import spawn_context_thread
+    from hermes_cli.backend_retirement import retirement
+    ownership = retirement.reserve()
+    if ownership is None:
+        return
+
     def _interrupt() -> None:
         try:
-            from agent.interrupt_compat import request_hard_interrupt
+            with ownership.scope():
+                try:
+                    from agent.interrupt_compat import request_hard_interrupt
+                    request_hard_interrupt(review_agent, message, tool_reason=tool_reason)
+                except Exception:
+                    logger.debug("Failed to cancel in-flight background review (%s)", message, exc_info=True)
+        finally:
+            ownership.finish()
 
-            request_hard_interrupt(review_agent, message, tool_reason=tool_reason)
-        except Exception:
-            logger.debug("Failed to cancel in-flight background review (%s)", message, exc_info=True)
-
+    thread = None
     try:
-        threading.Thread(target=_interrupt, daemon=True, name="bg-review-cancel").start()
+        thread = spawn_context_thread(_interrupt, name="bg-review-cancel")
+        thread.start()
     except Exception:
+        # A definite construction/start failure has no executing tail. A start
+        # that published a worker leaves settlement to that worker. BaseException
+        # interruption remains unknown and retains ownership until actual exit.
+        if thread is None or thread.ident is None:
+            ownership.finish()
         logger.debug("Failed to start background-review cancellation thread", exc_info=True)
 
 

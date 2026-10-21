@@ -391,6 +391,9 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _shutdown_sessions() -> None:
+    from hermes_cli.backend_retirement import retirement
+    if retirement.is_closed():
+        return  # Maintenance deferred this process's sessions; ordinary close would cancel them.
     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
     for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
         with contextlib.suppress(Exception):
@@ -417,7 +420,8 @@ def _start_idle_reaper() -> None:
         while True:
             time.sleep(_REAPER_SCAN_S)
             with contextlib.suppress(Exception):
-                _reap_idle_sessions()
+                from hermes_cli.backend_retirement import retirement
+                retirement.run_if_admitted(_reap_idle_sessions)
     threading.Thread(target=_loop, daemon=True).start()
 
 
@@ -1698,7 +1702,7 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
                 return  # discovery added nothing → don't churn the client
             info = _session_info(agent, session)
         _emit("session.info", sid, info)  # outside the lock — write_json must not block under _sessions_lock
-    threading.Thread(target=_wait_then_refresh, name=f"tui-mcp-late-refresh-{sid}", daemon=True).start()
+    _start_session_work(_wait_then_refresh, name=f"tui-mcp-late-refresh-{sid}")
 
 
 class _RuntimeFallbackResolution(NamedTuple):

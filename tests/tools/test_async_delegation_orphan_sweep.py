@@ -170,7 +170,7 @@ def test_restart_replay_and_sweep_never_offer_the_same_row_twice(tmp_path):
 
 
 @pytest.mark.parametrize("exhausted", ["attempts", "age"])
-def test_orphan_past_its_delivery_budget_converges_to_dropped(tmp_path, exhausted):
+def test_orphan_past_its_delivery_budget_stays_pending_without_an_offer(tmp_path, exhausted):
     home = tmp_path / "home"
     delegation_id = _orphan(home)
     row = _row(home, delegation_id)
@@ -179,11 +179,12 @@ def test_orphan_past_its_delivery_budget_converges_to_dropped(tmp_path, exhauste
         _set(home, delegation_id, delivery_attempts=ad._MAX_DELIVERY_ATTEMPTS)
     else:
         later = row["completed_at"] + ad._MAX_COMPLETION_REPLAY_AGE_S + 1
+    before = _row(home, delegation_id)
     q = queue.Queue()
     with _Home(home):
         assert ad.sweep_orphaned_completions(q, now=later) == 0
     assert q.empty()
-    assert _row(home, delegation_id)["delivery_state"] == "dropped"
+    assert _row(home, delegation_id) == before
 
 
 def test_in_flight_claim_is_left_to_its_holder(tmp_path):

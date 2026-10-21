@@ -131,6 +131,8 @@ def record_response_usage(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
     compressor.update_from_response(usage_dict)
+    from agent.context_measurement import capture_context_measurement
+    capture_context_measurement(agent, usage_dict['prompt_tokens'])
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
     # anchors on the turn's FIRST response: later same-turn responses inflate

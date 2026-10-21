@@ -23,6 +23,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
+from agent.memory_lifecycle import ProviderJobs, owned_call, retain
 from agent.secret_scope import get_secret
 from agent.file_safety import raise_if_read_blocked
 from tools.registry import tool_error
@@ -184,6 +185,7 @@ class _Client:
 class _WriteQueue:
     """SQLite-backed async write queue. Survives crashes — pending rows replay on startup."""
 
+    @owned_call
     def __init__(self, client: _Client, db_path: Path):
         self._client, self._db_path, self._q = client, db_path, queue.Queue()
         self._thread = spawn_context_thread(self._loop, name="retaindb-writer")
@@ -191,12 +193,15 @@ class _WriteQueue:
         self._local = threading.local()  # one cached connection per thread, all tracked in _connections
         self._connections: set[sqlite3.Connection] = set()
         self._connections_lock, self._shutdown_lock, self._shutdown = threading.Lock(), threading.Lock(), False
+        self._initialized = self._exited_cleanly = False
+        retain(self)
         conn = self._execute("CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
                              "session_id TEXT, messages_json TEXT, created_at TEXT, last_error TEXT)").connection
-        self._thread.start()
         replay = conn.execute("SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200").fetchall()
         for row_id, user_id, session_id, msgs_json in replay:  # rows left from a previous crash
             self._q.put((row_id, user_id, session_id, json.loads(msgs_json)))
+        self._thread.start()
+        self._initialized = True
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -223,6 +228,7 @@ class _WriteQueue:
         conn, self._local.conn = getattr(self._local, "conn", None), None
         self._close(*([conn] if conn is not None else []))
 
+    @owned_call
     def enqueue(self, user_id: str, session_id: str, messages: list) -> None:
         now = datetime.now(UTC).isoformat()
         with self._shutdown_lock:
@@ -248,21 +254,34 @@ class _WriteQueue:
                     self._flush_row(*item)
                 except Exception as exc:
                     logger.error("RetainDB writer error: %s", exc)
+            self._exited_cleanly = True
         finally:
             self._close_thread_conn()  # sqlite3 connections must close on their owning thread
 
-    def shutdown(self) -> None:
+    def maintenance_drain(self, deadline: float) -> bool:
+        if not self._initialized:
+            raise RuntimeError("Unknown RetainDB queue initialization")
         with self._shutdown_lock:
-            if self._shutdown:
-                return
-            self._shutdown = True
-            self._q.put(_ASYNC_SHUTDOWN)
-        self._close_thread_conn()  # caller thread owns the connection opened in __init__
-        self._thread.join(timeout=10)
-        if not self._thread.is_alive():  # exited executor workers may have left tracked handles (check_same_thread=False)
-            with self._connections_lock:
-                stragglers = list(self._connections)
-            self._close(*stragglers)
+            if not self._shutdown:
+                self._shutdown = True
+                self._q.put(_ASYNC_SHUTDOWN)
+        self._thread.join(max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive():
+            raise TimeoutError("RetainDB queue still active")
+        if not self._exited_cleanly:
+            raise RuntimeError("Unknown RetainDB writer settlement")
+        # No producer or consumer can use a connection now. check_same_thread=False
+        # allows the off-loop proof to close connections left by exited workers.
+        with self._connections_lock:
+            connections = tuple(self._connections)
+        self._close(*connections)
+        return True
+
+    def shutdown(self) -> None:
+        try:
+            self.maintenance_drain(time.monotonic() + 10)
+        except TimeoutError:
+            logger.warning("RetainDB ordinary shutdown timed out; retaining queue resources")
 
 
 def _compact(s: str) -> str:
@@ -305,6 +324,7 @@ class RetainDBMemoryProvider(MemoryProvider):
     """RetainDB cloud memory — durable queue, semantic search, dialectic synthesis, shared files."""
 
     def __init__(self):
+        self._jobs = ProviderJobs(self)
         self._client: _Client | None = None
         self._queue: _WriteQueue | None = None
         self._user_id, self._session_id, self._agent_id = "default", "", "hermes"
@@ -326,6 +346,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             {"key": "project", "description": "Project identifier (optional — uses 'default' project if not set)", "default": ""},
         ]
 
+    @owned_call
     def initialize(self, session_id: str, **kwargs) -> None:
         # Non-secret fields resolve env (profile-scoped) -> config.yaml (written by the Dashboard) -> default.
         cfg = {k: v.strip() for k, v in _load_retaindb_config().items() if isinstance(v, str)}
@@ -347,7 +368,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         soul = (home / "SOUL.md").read_text(encoding="utf-8-sig", errors="replace").strip() if (home / "SOUL.md").exists() else ""
         if soul:  # seed agent identity from SOUL.md in background
             seed = lambda: self._client.seed_agent_identity(self._agent_id, soul, source="soul_md")
-            spawn_context_thread(_quiet, args=("soul seed", seed), name="retaindb-soul-seed").start()
+            self._seed_thread = self._jobs.start(_quiet, args=("soul seed", seed), name="retaindb-soul-seed")
 
     def system_prompt_block(self) -> str:
         project = self._client.project if self._client else "retaindb"
@@ -369,10 +390,8 @@ class RetainDBMemoryProvider(MemoryProvider):
                 self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query)).get("answer") or "") or None),
             ("retaindb-agent-model", "agent model", "_agent_model", lambda: self._agent_model_or_none(self._client.get_agent_model(self._agent_id))),
         )
-        self._prefetch_threads = [spawn_context_thread(self._store, args=(label, attr, fetch), name=name)
+        self._prefetch_threads = [self._jobs.start(self._store, args=(label, attr, fetch), name=name)
                                   for name, label, attr, fetch in jobs]
-        for t in self._prefetch_threads:
-            t.start()
 
     def _context_overlay(self, query: str) -> dict:
         query_result = self._client.query_context(self._user_id, self._session_id, query)
@@ -463,6 +482,13 @@ class RetainDBMemoryProvider(MemoryProvider):
             return
         _quiet("memory mirror", lambda: self._client.add_memory(
             self._user_id, self._session_id, content, memory_type="preference" if target == "user" else "factual"))
+
+    def maintenance_drain(self, deadline: float) -> bool:
+        self._jobs.drain(deadline)
+        if self._queue is not None:
+            self._queue.maintenance_drain(deadline)
+        self._queue = self._client = None
+        return True
 
     def shutdown(self) -> None:
         for t in self._prefetch_threads:

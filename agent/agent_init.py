@@ -1340,12 +1340,26 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 )
                 agent._memory_store.load_from_disk()
 
-    # External memory provider plugin (one at a time, alongside built-in): memory.provider.
+    # External initialization is one admitted parent, including discovery/imports.
+    from agent.memory_lifecycle import MemoryAdmissionClosed, memory_work
+    try:
+        with memory_work():
+            _init_external_memory(agent, locals().get("mem_config", {}), skip_memory, platform, memory_manager)
+    except MemoryAdmissionClosed:
+        agent._memory_manager = None
+
+    from agent.memory_manager import inject_memory_provider_tools
+    inject_memory_provider_tools(agent)
+
+
+def _init_external_memory(agent, mem_config, skip_memory, platform, memory_manager):
+    from agent.memory_lifecycle import MemoryStartup, adopt_manager, retain_provider
     agent._memory_manager = None
     if memory_manager is not None and not skip_memory:
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead
         # of being re-initialized (#120116). No initialize_all — the providers are already bound.
+        adopt_manager(memory_manager)
         agent._memory_manager = memory_manager
     elif not skip_memory:
         try:
@@ -1354,12 +1368,15 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
+                startup = MemoryStartup()
+                _mp = _load_mem(_mem_provider_name, lifecycle=startup)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.
                     from hermes_cli.memory_provider_migration import recover_at_startup
                     if recover_at_startup(_mem_provider_name, say=agent._emit_startup_warning):
-                        _mp = _load_mem(_mem_provider_name)
+                        _mp = _load_mem(_mem_provider_name, lifecycle=startup)
+                if _mp is not None:
+                    retain_provider(_mp)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None and _unavailable_warning_key(_mem_provider_name) not in _warned_unavailable_providers:
@@ -1379,8 +1396,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools
-    inject_memory_provider_tools(agent)
 
 
 def _apply_agent_section(agent, _agent_cfg):

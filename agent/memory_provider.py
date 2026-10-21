@@ -106,6 +106,18 @@ class MemoryProvider(ABC):
     # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.
     pre_compress_checkpoint_api_version = 1
 
+    def maintenance_drain(self, deadline: float) -> bool:
+        """Optional concrete local-settlement proof; default is unsupported.
+
+        Called off the owner loop after root closure and admitted producers settle.
+        Implementations use the monotonic deadline, retain resources on timeout,
+        never initiate extraction, and return True only on complete local settlement.
+        A concrete hook also requires adoption at the reviewed provider integration
+        boundary; declarations, names and inheritance cannot authorize custom or
+        plugin-host proxy settlement.
+        """
+        raise NotImplementedError('Unsupported memory lifecycle')
+
     @property
     @abstractmethod
     def name(self) -> str:

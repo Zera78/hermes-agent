@@ -12,10 +12,12 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.memory_lifecycle import MemoryAdmissionClosed, fence, memory_work, owned_call, retain, retain_provider
 from agent.redact import redact_for_egress
 
 from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance, in_owner_home, refused_tool_message
@@ -227,6 +229,8 @@ class MemoryManager:
     """
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+        self._maintenance_fence = fence()
+        retain(self)
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
@@ -257,6 +261,13 @@ class MemoryManager:
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
         """Call ``call(provider)`` per provider, logging+swallowing failures; returns successes in order.
         ``label`` completes the log line ``Memory provider '<name>' <label>: <exc>``."""
+        try:
+            with memory_work():
+                return self._each_provider_owned(label, call, level=level, providers=providers, exc_info=exc_info)
+        except MemoryAdmissionClosed:
+            return []
+
+    def _each_provider_owned(self, label, call, *, level, providers, exc_info):
         results: list[Any] = []
         for provider in self._providers if providers is None else providers:
             try:
@@ -285,8 +296,10 @@ class MemoryManager:
         self._tool_to_provider = {t: p for t, p in self._tool_to_provider.items() if p is not provider}
         self._has_external = any(p.name != "builtin" for p in self._providers)
 
+    @owned_call
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
+        retain_provider(provider)
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
             logger.warning(
@@ -387,14 +400,32 @@ class MemoryManager:
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
 
-        thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
+        reservation = self._maintenance_fence.reserve()
+        if reservation is None:
+            return ""
+        def _owned_run():
+            try:
+                with reservation.scope(): _run()
+            finally:
+                reservation.finish()
+        try:
+            thread = spawn_context_thread(_owned_run, name=f"memory-prefetch-{provider.name}")
+        except Exception:
+            reservation.finish()
+            raise
         with self._external_prefetch_lock:
             existing = self._external_prefetch_threads.get(provider.name)
             if existing is not None and existing.is_alive():
                 logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
+                reservation.finish()
                 return ""
             self._external_prefetch_threads[provider.name] = thread
-            thread.start()
+            try:
+                thread.start()
+            except Exception:
+                self._external_prefetch_threads.pop(provider.name, None)
+                reservation.finish()
+                raise
 
         thread.join(self._external_prefetch_timeout)
         if thread.is_alive():
@@ -483,43 +514,55 @@ class MemoryManager:
         )
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
-        """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
-        durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
-        unavailable outside shutdown, run inline — the historical fail-safe."""
-        fn = ctx_bound(in_owner_home(self._bound_scope, fn))
-        executor = None if self._shutting_down else self._sync_executor
-        if executor is None and not self._shutting_down:
-            with self._sync_executor_lock:
-                if self._sync_executor is None and not self._shutting_down:
-                    try:
-                        # Daemon workers: a wedged provider must never block interpreter exit.
-                        from tools.daemon_pool import DaemonThreadPoolExecutor
-                        self._sync_executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="mem-sync")
-                    except Exception as e:  # pragma: no cover - resource exhaustion
-                        logger.warning("Failed to create memory sync executor: %s", e)
-                executor = self._sync_executor
+        """Reserve before publishing FIFO work; retain child authority on worker entry.
+
+        A submit failure can occur after enqueue (worker start failure). The shared
+        claim prevents the historical inline fallback and that queued copy both
+        executing the same logical write.
+        """
+        reservation = self._maintenance_fence.reserve()
+        if reservation is None:
+            return
+        with reservation.scope():
+            fn = ctx_bound(in_owner_home(self._bound_scope, fn))
+        claim = threading.Lock()
+        started = False
+        def run():
+            nonlocal started
+            with claim:
+                if started: return
+                started = True
+            try:
+                with reservation.scope(): fn()
+            finally:
+                reservation.finish()
         future = None
         try:
-            # Submit+track atomically with the shutdown snapshot. The callback is attached
-            # outside the lock: an already-completed future invokes callbacks synchronously.
             with self._sync_executor_lock:
                 if self._shutting_down:
-                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
+                    reservation.finish()
                     return
-                if executor is not None:
-                    future = executor.submit(fn)
+                if self._sync_executor is None:
+                    try:
+                        from tools.daemon_pool import DaemonThreadPoolExecutor
+                        self._sync_executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="mem-sync")
+                    except Exception as exc:
+                        logger.warning("Failed to create memory sync executor: %s", exc)
+                if self._sync_executor is not None:
+                    future = self._sync_executor.submit(run)
                     self._background_futures[future] = kind
         except RuntimeError:
-            if self._shutting_down:
-                logger.warning("Memory manager shut down during %s submission; task rejected", kind)
-                return
+            # Retain the same reservation and exactly-once claim for inline fallback.
+            pass
         if future is not None:
-            future.add_done_callback(self._forget_background_future)
-            return
-        try:
-            fn()
-        except Exception as e:  # pragma: no cover - fn guards internally
-            logger.debug("Inline memory background task failed: %s", e)
+            def settled(future):
+                try:
+                    self._forget_background_future(future)
+                finally:
+                    if future.cancelled(): reservation.finish()
+            future.add_done_callback(settled)
+        else:
+            run()
 
     def _forget_background_future(self, future: Future) -> None:
         with self._sync_executor_lock:
@@ -566,6 +609,7 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
+    @owned_call
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         provider = self._tool_to_provider.get(tool_name)
@@ -670,6 +714,7 @@ class MemoryManager:
         versions = (self._checkpoint_api_version(p) for p in self._providers)
         return any(v is not None and v >= api_version for v in versions)
 
+    @owned_call
     def on_pre_compress(self, messages: list[dict[str, Any]], *,
                         evidence_messages: Optional[list[dict[str, Any]]] = None, require_checkpoint: bool = False,
                         checkpoint_api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION) -> str:
@@ -815,8 +860,40 @@ class MemoryManager:
             lambda p: p.on_delegation(task, result, child_session_id=child_session_id, **kwargs),
         )
 
+    def maintenance_drain(self, deadline: float) -> bool:
+        """No extraction, cancellation, or ordinary provider shutdown here.
+
+        Called after the process's admitted producer tree has settled. Executor
+        joins also cover its completion callbacks; provider proofs are separately
+        retained by instance, even if registration/initialization failed later.
+        """
+        with self._sync_executor_lock:
+            executor = self._sync_executor
+            pending = any(not future.done() for future in self._background_futures)
+        if pending:
+            raise TimeoutError("Memory manager jobs still active")
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=False)
+            for thread in tuple(executor._threads):
+                thread.join(max(0.0, deadline - time.monotonic()))
+                if thread.is_alive(): raise TimeoutError("Memory manager callbacks still active")
+        with self._external_prefetch_lock:
+            threads = tuple(self._external_prefetch_threads.values())
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive(): raise TimeoutError("Memory recall still active")
+        # Include injected provider-list integrations encountered before maintenance.
+        # Normal registration retains these before any provider call.
+        for provider in self._providers:
+            retain_provider(provider)
+        return True
+
     def shutdown_all(self) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
+        if self._maintenance_fence.is_closed():
+            # Strict maintenance owns cleanup now; the ordinary path can cancel
+            # queued writes and tear down a provider after a timed join.
+            return
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])

@@ -212,7 +212,28 @@ def discover_memory_providers() -> list[tuple[str, str, bool]]:
     return results
 
 
-def load_memory_provider(name: str, *, register_skills: Optional[bool] = None) -> Optional[MemoryProvider]:
+# Reviewed local lifecycle implementations, selected by exact loaded class identity.
+# This lives at the bundled integration boundary, not in the generic manager.
+_REVIEWED_MAINTENANCE_PROVIDERS = (
+    ("plugins.memory.retaindb", "RetainDBMemoryProvider"),
+    ("plugins.memory.byterover", "ByteRoverMemoryProvider"),
+)
+
+
+def reviewed_provider_drain(provider):
+    """Return the reviewed concrete proof without imports, discovery or availability I/O.
+
+    A name or a self-declared hook cannot adopt a custom/subclass/proxy integration.
+    Custom discovery also retains its separate unresolved startup record.
+    """
+    for module_name, class_name in _REVIEWED_MAINTENANCE_PROVIDERS:
+        reviewed = getattr(sys.modules.get(module_name), class_name, None)
+        if reviewed is not None and type(provider) is reviewed:
+            return reviewed.__dict__.get("maintenance_drain")
+    return None
+
+
+def load_memory_provider(name: str, *, register_skills: Optional[bool] = None, lifecycle=None) -> Optional[MemoryProvider]:
     """Load a MemoryProvider by name (bundled, user, project, then pip entry point);
     None if not found or failing to load. Skills register only for the configured
     active provider unless ``register_skills`` is explicit, so inspecting inactive
@@ -242,7 +263,12 @@ def load_memory_provider(name: str, *, register_skills: Optional[bool] = None) -
             return None
         return _load_provider_from_entry_point(entry_point, register_skills=register_skills)
 
-    return _loader.load_named(name, provider_dir, _load, kind="Memory provider", noun="provider", logger=logger)
+    provider = _loader.load_named(name, provider_dir, _load, kind="Memory provider", noun="provider", logger=logger)
+    if lifecycle is not None:
+        # Custom directory/entry-point/host integrations retain an unsupported
+        # import record, even if they return a familiar concrete provider object.
+        lifecycle.resolved = provider is not None and provider_dir is not None and _is_bundled(provider_dir)
+    return provider
 
 
 def import_memory_provider_module(name: Optional[str] = None) -> bool:

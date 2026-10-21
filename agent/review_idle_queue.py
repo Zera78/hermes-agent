@@ -66,6 +66,7 @@ class _PendingReview:
     kwargs: dict[str, Any]
     enqueued_at: float
     context: contextvars.Context
+    ownership: Any
 
 
 class ReviewIdleQueue:
@@ -76,6 +77,7 @@ class ReviewIdleQueue:
         self._pending: dict[str, _PendingReview] = {}
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._maintenance = threading.Event()
         self._live_turns = 0
         self._quiet_since: Optional[float] = None
         # Test seams — replaced by unit tests, never in production.
@@ -97,14 +99,34 @@ class ReviewIdleQueue:
     def enqueue(self, agent: Any, session_key: str, kwargs: dict[str, Any]) -> None:
         """Add (or replace — newest snapshot wins) a session's pending review, keeping the ORIGINAL
         enqueue time on coalesce so a busy session cannot push its age-out forever."""
-        with self._lock:
-            existing = self._pending.get(session_key)
-            enqueued_at = existing.enqueued_at if existing is not None else self._now()
-            self._pending[session_key] = _PendingReview(
-                agent, session_key, kwargs, enqueued_at, contextvars.copy_context())
-        self._ensure_thread()
+        from hermes_cli.backend_retirement import retirement
+        ownership = retirement.reserve()
+        if ownership is None:
+            return
+        item = None
+        try:
+            with self._lock:
+                existing = self._pending.get(session_key)
+                enqueued_at = existing.enqueued_at if existing is not None else self._now()
+                item = _PendingReview(agent, session_key, kwargs, enqueued_at,
+                                      contextvars.copy_context(), ownership)
+                self._pending[session_key] = item
+            if existing is not None:
+                existing.ownership.finish()
+            self._ensure_thread()
+            self._wake.set()
+        except Exception:
+            # BaseException is not caught: an interrupted start may already be executing this item.
+            with self._lock:
+                if item is not None and self._pending.get(session_key) is item:
+                    del self._pending[session_key]
+            ownership.finish()
+            raise
+
+    def begin_maintenance(self):
+        """Expedite only the already-owned cohort, including descendants accepted after close."""
+        self._maintenance.set()
         self._wake.set()
-        logger.info("Background review deferred (session=%s, queued=%d)", session_key[-12:], len(self._pending))
 
     def pending_count(self) -> int:
         with self._lock:
@@ -128,6 +150,10 @@ class ReviewIdleQueue:
         with self._lock:
             if not self._pending:
                 return None
+            from hermes_cli.backend_retirement import retirement
+            if retirement.is_closed():
+                candidate = min(self._pending.values(), key=lambda p: p.enqueued_at)
+                return self._pending.pop(candidate.session_key)
             now = self._now()
             aged = [p for p in self._pending.values()
                     if now - p.enqueued_at >= defer_max_age_s(p.kwargs.get("task_cfg"))]
@@ -158,9 +184,16 @@ class ReviewIdleQueue:
             except Exception:
                 logger.warning("Deferred review dispatch failed", exc_info=True)
             if item is None:
-                time.sleep(_POLL_INTERVAL_S)
+                self._maintenance.wait(_POLL_INTERVAL_S)
 
     def _dispatch(self, item: _PendingReview) -> None:
+        try:
+            with item.ownership.scope():
+                self._dispatch_owned(item)
+        finally:
+            item.ownership.finish()
+
+    def _dispatch_owned(self, item: _PendingReview) -> None:
         if not self._still_enabled(item):
             logger.info(
                 "Deferred background review dropped: reviews were disabled while it was queued (session=%s)",
@@ -169,7 +202,11 @@ class ReviewIdleQueue:
         logger.info(
             "Dispatching deferred background review (session=%s, waited=%.0fs, queued=%d)",
             item.session_key[-12:], self._now() - item.enqueued_at, self.pending_count())
-        item.agent._spawn_background_review_now(**item.kwargs)
+        from hermes_cli.backend_retirement import retirement
+        kwargs = dict(item.kwargs)
+        if retirement.is_closed():
+            kwargs["_wait_for_slot"] = True
+        item.agent._spawn_background_review_now(**kwargs)
 
     @staticmethod
     def _still_enabled(item: _PendingReview) -> bool:

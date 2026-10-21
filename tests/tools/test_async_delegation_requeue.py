@@ -50,14 +50,15 @@ def test_requeue_returns_an_acknowledged_completion_to_pending_and_offers_it():
     assert (hermes_home_key(get_hermes_home()), "requeue-ok") in ad._offered
 
 
-def test_requeue_past_the_delivery_budget_drops_the_completion():
+def test_requeue_past_the_delivery_budget_parks_the_completion():
     _persisted("requeue-spent")
     _set("requeue-spent", "delivery_attempts", ad._MAX_DELIVERY_ATTEMPTS)
     offered: queue.Queue = queue.Queue()
 
     assert ad.requeue_admitted_completion("requeue-spent", offered) is False
 
-    assert _column("requeue-spent", "delivery_state") == "dropped"
+    assert _column("requeue-spent", "delivery_state") == "pending"
+    assert _column("requeue-spent", "delivered_at") is None
     assert offered.empty()
 
 
